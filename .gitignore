@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+.venv/
+
+# Secrets
+.env
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+
+# Output
+output/
+
+# Backup
+backup/
+
+# VSCode
+.vscode/
+
+# Excel temp files
+~$*.xlsx
