@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-from openpyxl import load_workbook
+from openpyxl import load_workbook 
 
 from api.codal_api import CodalAPI
 from services.monthly_sales_html_parser import MonthlySalesHtmlParser
@@ -14,6 +14,7 @@ from services.monthly_sales_html_parser import MonthlySalesHtmlParser
 # ============================================================
 
 WORKBOOK_PATH = Path("excel/TSE-Codal-Month-Sales-Extracted.xlsx")
+MASTER_PATH = Path("excel/AA-TSE-Master.xlsx")
 
 MANUAL_SHEET = "Manual 1405 04 31"
 AUTO_SHEET = "Auto 1405 04 31"
@@ -169,7 +170,32 @@ def report_matches_symbol_and_period(report, symbol):
         report_symbol == target_symbol
         and TARGET_PERIOD in title
     )
-def select_latest_report(all_reports, symbol):
+
+def report_matches_company_and_period(report, company_name):
+    """
+    Fallback matcher:
+    use Company Name only when Symbol matching finds nothing.
+    """
+
+    if not company_name:
+        return False
+
+    target_company = normalize_text(company_name)
+
+    title = normalize_digits(
+        normalize_text(report.get("title", ""))
+    )
+
+    record_text = normalize_text(
+        str(report)
+    )
+
+    return (
+        target_company in record_text
+        and TARGET_PERIOD in title
+    )
+
+def select_latest_report(all_reports, symbol, company_name=None):
     """
     Find all reports for symbol + target period and select
     the latest published one.
@@ -180,13 +206,29 @@ def select_latest_report(all_reports, symbol):
         # CODAL symbol aliases
 
     candidates = [
+    report
+    for report in all_reports
+    if report_matches_symbol_and_period(
+        report,
+        symbol,
+    )
+]
+
+    if not candidates and company_name:
+        candidates = [
         report
         for report in all_reports
-        if report_matches_symbol_and_period(
+        if report_matches_company_and_period(
             report,
-            symbol,
+            company_name,
         )
     ]
+
+    if candidates:
+        print(
+            f"  COMPANY NAME FALLBACK: "
+            f"{symbol} -> {company_name}"
+        )
 
     if not candidates:
         return None, 0
@@ -348,9 +390,13 @@ def clear_auto_data(ws):
             ).value = None
 
 
-def get_symbol_rows(ws):
+def get_symbol_rows(ws, company_by_name):
     """
+    Column B = Company Name.
     Column C = Symbol.
+
+    Company Name is used to obtain the authoritative Symbol
+    from AA-TSE-Master.
 
     Skip empty rows and header rows automatically.
     """
@@ -358,30 +404,39 @@ def get_symbol_rows(ws):
     rows = []
 
     for row in range(1, ws.max_row + 1):
+        raw_company_name = ws.cell(
+            row=row,
+            column=2,
+        ).value
+
         raw_symbol = ws.cell(
             row=row,
             column=3,
         ).value
 
-        symbol = normalize_text(raw_symbol)
+        company_name = normalize_text(raw_company_name)
+        sheet_symbol = normalize_text(raw_symbol)
 
-        if not symbol:
+        if not company_name or not sheet_symbol:
             continue
 
-        # obvious header protection
-        if symbol in (
+        if sheet_symbol in (
             "نماد",
             "Symbol",
             "symbol",
         ):
             continue
 
+        symbol = company_by_name.get(
+            company_name,
+            sheet_symbol,
+        )
+
         rows.append(
-            (row, symbol)
+            (row, symbol, company_name)
         )
 
     return rows
-
 
 # ============================================================
 # LOG
@@ -512,6 +567,54 @@ def write_parser_result(ws, row, result):
         result["export_month"]
     )
 
+def load_company_name_map():
+    """
+    Build Symbol -> Company Name mapping
+    from AA-TSE-Master.xlsx.
+
+    Cement and MOPFRA:
+    Q = Company Name
+    R = Symbol
+    """
+
+    if not MASTER_PATH.exists():
+        raise FileNotFoundError(
+            f"Master workbook not found: {MASTER_PATH}"
+        )
+
+    master_wb = load_workbook(
+        MASTER_PATH,
+        data_only=True,
+        read_only=True,
+    )
+
+    company_map = {}
+    company_by_name = {}
+
+    for sheet_name in ("Cement", "MOPFRA"):
+        if sheet_name not in master_wb.sheetnames:
+            continue
+
+        ws = master_wb[sheet_name]
+
+        for row in range(1, ws.max_row + 1):
+            company_name = normalize_text(
+                ws.cell(row=row, column=17).value
+            )
+
+            symbol = normalize_text(
+                ws.cell(row=row, column=18).value
+            )
+
+            if not symbol or not company_name:
+                continue
+
+            company_map[symbol] = company_name
+            company_by_name[company_name] = symbol
+
+    master_wb.close()
+
+    return company_map, company_by_name
 
 # ============================================================
 # MAIN
@@ -556,10 +659,14 @@ def main():
     log_ws = prepare_log_sheet(
         wb
     )
+    company_map, company_by_name = load_company_name_map()
 
     symbol_rows = get_symbol_rows(
-        auto_ws
+        auto_ws,
+        company_by_name,
     )
+    
+    print(f"{len(company_map)} company names loaded from AA-TSE-Master.")
 
     print()
     print(
@@ -588,7 +695,7 @@ def main():
 
     total = len(symbol_rows)
 
-    for index, (row, symbol) in enumerate(
+    for index, (row, symbol, company_name) in enumerate(
         symbol_rows,
         start=1,
     ):
@@ -601,6 +708,7 @@ def main():
             select_latest_report(
                 all_reports,
                 symbol,
+                company_name,
             )
         )
 
@@ -639,10 +747,6 @@ def main():
 
             parsed = parser.parse(html)
 
-            if symbol == "فن افزار":
-                print("\n===== FANAFZAR BATCH DEBUG =====")
-                print("PARSED:", parsed)
-                print("================================\n")
 
             write_parser_result(
                 auto_ws,
