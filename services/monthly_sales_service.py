@@ -586,16 +586,13 @@ class MonthlySalesService:
             )
 
             matched_symbol = next(
-                (
-                    symbol
-                    for symbol in symbol_set
-                    if (
-                        report_symbol == symbol
-                        or symbol in searchable_symbol_text
-                    )
-                ),
-                None,
-            )
+    (
+        symbol
+        for symbol in symbol_set
+        if report_symbol == symbol
+    ),
+    None,
+)
 
             if matched_symbol is None:
                 continue
