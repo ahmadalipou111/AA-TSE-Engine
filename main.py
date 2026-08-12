@@ -110,46 +110,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def find_latest_aa_tse_workbook() -> Path:
     """
-    Find the newest AA-TSE workbook inside the project's excel folder.
+    Return the authoritative AA-TSE Master workbook.
     """
 
-    excel_dir = BASE_DIR / "excel"
-    excel_dir.mkdir(parents=True, exist_ok=True)
+    workbook_path = BASE_DIR / "excel" / "AA-TSE-Master.xlsx"
 
-    patterns = [
-        "AA-TSE-*.xlsx",
-        "AA_TSE_*.xlsx",
-        "*AA-TSE*.xlsx",
-    ]
-
-    candidates: list[Path] = []
-
-    for pattern in patterns:
-        candidates.extend(excel_dir.glob(pattern))
-
-    valid_candidates = [
-        path
-        for path in candidates
-        if path.is_file()
-        and not path.name.startswith("~$")
-        and path.suffix.lower() == ".xlsx"
-    ]
-
-    if not valid_candidates:
+    if not workbook_path.exists():
         raise FileNotFoundError(
-            "\nNo AA-TSE workbook was found inside:\n"
-            f"{excel_dir}\n\n"
-            "Copy the latest AA-TSE Excel file into the project's "
-            "'excel' folder and run the program again."
+            f"AA-TSE Master workbook not found: {workbook_path}"
         )
 
-    latest_file = max(
-        valid_candidates,
-        key=lambda path: path.stat().st_mtime,
-    )
-
-    return latest_file.resolve()
-
+    return workbook_path
 
 def resolve_workbook_path(
     supplied_path: str | None,
