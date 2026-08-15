@@ -18,7 +18,7 @@ from services.monthly_sales_html_parser import MonthlySalesHtmlParser
 # ============================================================
 
 WORKBOOK_PATH = Path("excel/TSE-Codal-Month-Sales-Extracted.xlsx")
-MASTER_PATH = Path("excel/AA-TSE-Master.xlsx")
+MASTER_PATH = Path("excel/AAI-TSE-Master.xlsx")
 
 # Existing validated sheet used only as the layout/template
 TEMPLATE_SHEET = "Manual 1405 04 31"
@@ -189,7 +189,6 @@ def gregorian_to_jalali(year, month, day):
         - (gregorian_year + 99) // 100
         + (gregorian_year + 399) // 400
     )
-
     for month_index in range(gregorian_month):
         day_number += gregorian_days_in_month[month_index]
 
@@ -227,6 +226,12 @@ def gregorian_to_jalali(year, month, day):
         jalali_month += 1
 
     return jalali_year, jalali_month + 1, jalali_day_number + 1
+
+
+def prior_year_period(period):
+    """Return the same reporting month/day in the preceding Jalali year."""
+    year, month, day = parse_period(period)
+    return format_period(year - 1, month, day)
 
 
 def today_jalali():
@@ -323,16 +328,55 @@ def shared_publish_range(periods):
     return first_start, today_end
 
 
-def monthly_publish_windows(date_start, date_end, window_days=7):
-    """Split an inclusive Jalali date range into short monthly windows.
+def missing_period_publish_ranges(periods):
+    """Return the smallest normal publish windows needed for backfill.
 
-    Windows never cross a Jalali month boundary and contain at most
-    ``window_days`` dates.  Keeping each BRSAPI query small prevents a busy
-    month from exceeding the per-window pagination safety limit.
+    Existing Company+Period data is deliberately excluded before this helper
+    is called.  Adjacent windows are merged, while gaps remain separate so a
+    sparse backfill does not fetch announcements for already-complete months.
+    This is base/backfill behaviour only; a future revision sweep may search
+    beyond these normal publication windows.
     """
-    if window_days < 1:
-        raise ValueError("window_days must be at least 1.")
+    today_year, today_month, today_day = today_jalali()
+    today_end = f"{today_year:04d}-{today_month:02d}-{today_day:02d}"
+    windows = []
 
+    for period in sorted(set(periods), key=parse_period):
+        date_start, date_end = publish_range_for_period(period)
+        if date_start > today_end:
+            continue
+        windows.append((date_start, min(date_end, today_end)))
+
+    merged = []
+    for date_start, date_end in windows:
+        if not merged:
+            merged.append([date_start, date_end])
+            continue
+
+        previous_end = parse_period(merged[-1][1])
+        current_start = parse_period(date_start)
+        previous_year, previous_month, previous_day = previous_end
+        is_same_month = current_start[:2] == previous_end[:2]
+        is_next_month = (
+            current_start[2] == 1
+            and current_start[:2] == next_jalali_month(
+                previous_year, previous_month
+            )
+            and previous_day == jalali_month_days(
+                previous_year, previous_month
+            )
+        )
+
+        if is_same_month or is_next_month:
+            merged[-1][1] = max(merged[-1][1], date_end)
+        else:
+            merged.append([date_start, date_end])
+
+    return [tuple(window) for window in merged]
+
+
+def monthly_publish_windows(date_start, date_end):
+    """Split an inclusive Jalali date range at month boundaries only."""
     start_year, start_month, start_day = parse_period(date_start)
     end_year, end_month, end_day = parse_period(date_end)
 
@@ -354,21 +398,30 @@ def monthly_publish_windows(date_start, date_end, window_days=7):
             end_month,
         ) else jalali_month_days(year, month)
 
-        chunk_start_day = window_start_day
-        while chunk_start_day <= window_end_day:
-            chunk_end_day = min(
-                chunk_start_day + window_days - 1,
-                window_end_day,
-            )
-            windows.append((
-                f"{year:04d}-{month:02d}-{chunk_start_day:02d}",
-                f"{year:04d}-{month:02d}-{chunk_end_day:02d}",
-            ))
-            chunk_start_day = chunk_end_day + 1
+        windows.append((
+            f"{year:04d}-{month:02d}-{window_start_day:02d}",
+            f"{year:04d}-{month:02d}-{window_end_day:02d}",
+        ))
 
         year, month = next_jalali_month(year, month)
 
     return windows
+
+
+def split_publish_window(date_start, date_end):
+    """Bisect one same-month inclusive Jalali window without losing a date."""
+    start_year, start_month, start_day = parse_period(date_start)
+    end_year, end_month, end_day = parse_period(date_end)
+    if (start_year, start_month) != (end_year, end_month):
+        raise ValueError("A pagination split must stay inside one Jalali month.")
+    if start_day >= end_day:
+        return None
+
+    midpoint = (start_day + end_day) // 2
+    return (
+        (date_start, f"{start_year:04d}-{start_month:02d}-{midpoint:02d}"),
+        (f"{start_year:04d}-{start_month:02d}-{midpoint + 1:02d}", date_end),
+    )
 
 
 def announcement_identity(report):
@@ -490,33 +543,50 @@ def fetch_all_announcements(
     api,
     date_start,
     date_end,
+    company_count,
+    rate_state=None,
 ):
     """
     Fetch all monthly-sales announcements for the publish-date range.
 
-    Large ranges are split by Jalali month and then into windows of at most
-    seven days. Pagination starts again at page 1 for every window. The
-    windows still cover the complete requested range, so late revisions remain
-    available to select_latest_report().
+    Large ranges are split into Jalali calendar months.  The per-window page
+    limit is dynamic (twice the Sales-enabled company count, with a floor of
+    20).  A window that reaches the limit is bisected and retried recursively,
+    preserving complete coverage without making every normal query small.
     """
 
     all_reports = []
     seen_reports = set()
-    rate_state = {"last_request_at": float("-inf")}
+    if rate_state is None:
+        rate_state = {"last_request_at": float("-inf")}
 
     print("=" * 70)
     print("FETCHING CODAL ANNOUNCEMENTS")
     print("=" * 70)
 
-    windows = monthly_publish_windows(date_start, date_end)
+    try:
+        company_count = int(company_count)
+    except (TypeError, ValueError):
+        raise ValueError("company_count must be a positive integer.")
+    if company_count < 1:
+        raise ValueError("company_count must be a positive integer.")
+    pagination_limit = max(20, 2 * company_count)
 
-    for window_index, (window_start, window_end) in enumerate(windows, start=1):
+    windows = monthly_publish_windows(date_start, date_end)
+    pending_windows = list(windows)
+    completed_windows = 0
+
+    while pending_windows:
+        window_start, window_end = pending_windows.pop(0)
         print(
-            f"Window {window_index}/{len(windows)}: "
-            f"{window_start} through {window_end}"
+            f"Window {completed_windows + 1}: {window_start} through {window_end} "
+            f"(pagination limit {pagination_limit})"
         )
         page = 1
         previous_page_signature = None
+        window_reports = []
+        window_seen = set()
+        overflowed = False
 
         while True:
             data = _get_announcements_with_retry(
@@ -544,9 +614,9 @@ def fetch_all_announcements(
 
             for report in reports:
                 identity = announcement_identity(report)
-                if identity not in seen_reports:
-                    seen_reports.add(identity)
-                    all_reports.append(report)
+                if identity not in window_seen:
+                    window_seen.add(identity)
+                    window_reports.append(report)
 
             count_page = (
                 data.get("count_page")
@@ -562,12 +632,33 @@ def fetch_all_announcements(
                 except (TypeError, ValueError):
                     pass
 
-            page += 1
-            if page > 100:
-                raise RuntimeError(
-                    "Pagination safety limit exceeded for window "
-                    f"{window_start} through {window_end}."
+            if page >= pagination_limit:
+                child_windows = split_publish_window(window_start, window_end)
+                if child_windows is None:
+                    raise RuntimeError(
+                        "Pagination safety limit reached for the smallest "
+                        f"possible window ({window_start})."
+                    )
+                print(
+                    "  Pagination limit reached; splitting into "
+                    f"{child_windows[0][0]} through {child_windows[0][1]} and "
+                    f"{child_windows[1][0]} through {child_windows[1][1]}."
                 )
+                pending_windows[0:0] = child_windows
+                overflowed = True
+                break
+
+            page += 1
+
+        if overflowed:
+            continue
+
+        completed_windows += 1
+        for report in window_reports:
+            identity = announcement_identity(report)
+            if identity not in seen_reports:
+                seen_reports.add(identity)
+                all_reports.append(report)
 
     print()
     print(
@@ -606,7 +697,16 @@ def report_matches_symbol_and_period(
     return (
         report_symbol == target_symbol
         and target_period in title
+        and is_monthly_activity_report(report)
     )
+
+
+def is_monthly_activity_report(report):
+    """Positively identify CODAL monthly-activity announcements by title."""
+    title = normalize_text(report.get("title", ""))
+    compact_title = re.sub(r"[\s\u200c\-_]+", "", title).casefold()
+    required_phrase = "\u06af\u0632\u0627\u0631\u0634\u0641\u0639\u0627\u0644\u06cc\u062a\u0645\u0627\u0647\u0627\u0646\u0647"
+    return required_phrase in compact_title
 
 def report_matches_company_and_period(
     report,
@@ -634,6 +734,7 @@ def report_matches_company_and_period(
     return (
         target_company in record_text
         and target_period in title
+        and is_monthly_activity_report(report)
     )
 
 def select_latest_report(
@@ -661,6 +762,7 @@ def select_latest_report(
     )
 ]
 
+    used_company_fallback = False
     if not candidates and company_name:
         candidates = [
         report
@@ -669,10 +771,11 @@ def select_latest_report(
             report,
             company_name,
             target_period,
-        )
-    ]
+            )
+        ]
+        used_company_fallback = bool(candidates)
 
-    if candidates:
+    if used_company_fallback:
         print(
             f"  COMPANY NAME FALLBACK: "
             f"{symbol} -> {company_name}"
@@ -732,6 +835,82 @@ def download_html(report, symbol, target_period):
     )
 
     return response.text, path
+
+
+def apply_prior_year_sales_fallback(
+    parsed,
+    symbol,
+    company_name,
+    target_period,
+    parser,
+    api,
+    company_count,
+    rate_state,
+    prior_year_reports_cache,
+):
+    """Fill a structurally absent current-report comparison from prior YTD.
+
+    This function must only be called after the current report parsed
+    successfully.  Announcement batches are cached by prior-year period, so
+    every company sharing that publication window reuses the same BRSAPI data.
+    """
+    if parsed.get("sales_last_year") is not None:
+        return "NOT_NEEDED", None, None
+
+    fallback_period = prior_year_period(target_period)
+    if fallback_period not in prior_year_reports_cache:
+        date_start, date_end = publish_range_for_period(fallback_period)
+        print(
+            "  PRIOR-YEAR FALLBACK: fetching cached announcement batch "
+            f"for {fallback_period} ({date_start} through {date_end})"
+        )
+        prior_year_reports_cache[fallback_period] = fetch_all_announcements(
+            api,
+            date_start,
+            date_end,
+            company_count=company_count,
+            rate_state=rate_state,
+        )
+
+    prior_report, prior_report_count = select_latest_report(
+        prior_year_reports_cache[fallback_period],
+        symbol,
+        company_name,
+        fallback_period,
+    )
+    if prior_report is None:
+        return "MISSING_PRIOR_REPORT", None, (
+            f"No valid monthly-activity report found for {fallback_period}; "
+            "sales_last_year remains empty."
+        )
+
+    try:
+        prior_html, prior_html_path = download_html(
+            prior_report, symbol, fallback_period
+        )
+        prior_parsed = parser.parse(prior_html)
+    except Exception as error:
+        return "PRIOR_PARSE_FAILED", prior_report, (
+            f"Prior-year report could not be parsed ({type(error).__name__}: "
+            f"{error}); sales_last_year remains empty."
+        )
+
+    prior_sales_ytd = prior_parsed.get("sales_ytd")
+    if prior_sales_ytd is None:
+        return "MISSING_PRIOR_SALES_YTD", prior_report, (
+            f"Prior-year report for {fallback_period} has no sales_ytd; "
+            "sales_last_year remains empty."
+        )
+
+    parsed["sales_last_year"] = prior_sales_ytd
+    revision_note = (
+        f"; latest of {prior_report_count} prior-year candidates selected"
+        if prior_report_count > 1 else ""
+    )
+    return "FILLED", prior_report, (
+        f"sales_last_year filled from {fallback_period} sales_ytd"
+        f"{revision_note}; HTML: {prior_html_path}"
+    )
 
 
 # ============================================================
@@ -838,13 +1017,88 @@ def clear_auto_data(ws):
             ).value = None
 
 
-def get_symbol_rows(ws, company_by_name):
+def _metadata_column(ws, accepted_labels):
+    """Find a metadata header in A:G without ever touching H:N outputs."""
+    normalized_labels = {
+        re.sub(r"[\s_\-]+", "", normalize_digits(normalize_text(label))).casefold()
+        for label in accepted_labels
+    }
+    for row in range(1, ws.max_row + 1):
+        for column in range(1, 8):
+            value = ws.cell(row=row, column=column).value
+            if value is None or str(value).startswith("="):
+                continue
+            normalized = re.sub(
+                r"[\s_\-]+", "", normalize_digits(normalize_text(value))
+            ).casefold()
+            if normalized in normalized_labels:
+                return column
+    return None
+
+
+def update_auto_metadata(ws, symbol_rows, target_period):
+    """Refresh period metadata while preserving template formulas (notably G)."""
+    report_month_column = _metadata_column(
+        ws, ("ماه گزارش", "Report Month", "report_month")
+    )
+    stale_last_year_column = _metadata_column(
+        ws, ("فروش سال قبل", "Prior Year Sales", "Last Year Sales")
+    )
+
+    if report_month_column is None:
+        raise RuntimeError("Report Month metadata header was not found in A:G.")
+
+    report_month = parse_period(target_period)[1]
+    for row, *_ in symbol_rows:
+        ws.cell(row=row, column=report_month_column).value = report_month
+        if stale_last_year_column is not None:
+            ws.cell(row=row, column=stale_last_year_column).value = None
+
+    return report_month_column, stale_last_year_column
+
+
+def row_has_valid_sales_data(ws, row):
+    """A completed parser write always populates every H:N output cell."""
+    return all(
+        ws.cell(row=row, column=column).value is not None
+        for column in range(8, 15)
+    )
+
+
+def existing_sales_by_company(ws, company_map, company_by_name):
+    """Capture valid H:N data using authoritative Company_ID as the key."""
+    existing = {}
+    for row, _symbol, _name, company_id, _start_period in get_symbol_rows(
+        ws, company_map, company_by_name
+    ):
+        if row_has_valid_sales_data(ws, row):
+            existing[company_id] = tuple(
+                ws.cell(row=row, column=column).value
+                for column in range(8, 15)
+            )
+    return existing
+
+
+def restore_existing_sales(ws, symbol_rows, existing):
+    """Restore valid values after refreshing the sheet from the template."""
+    restored = set()
+    for row, _symbol, _name, company_id, _start_period in symbol_rows:
+        values = existing.get(company_id)
+        if values is None:
+            continue
+        for column, value in enumerate(values, start=8):
+            ws.cell(row=row, column=column).value = value
+        restored.add(company_id)
+    return restored
+
+
+def get_symbol_rows(ws, company_map, company_by_name):
     """
     Column B = Company Name.
     Column C = Symbol.
 
-    Company Name is used to obtain the authoritative Symbol
-    from AA-TSE-Master.
+    Company Name or Symbol is used to obtain the authoritative company
+    record from AAI-TSE-Master / Companies.
 
     Skip empty rows and header rows automatically.
     """
@@ -875,13 +1129,23 @@ def get_symbol_rows(ws, company_by_name):
         ):
             continue
 
-        symbol = company_by_name.get(
-            company_name,
-            sheet_symbol,
-        )
+        company = company_by_name.get(company_name)
+        if company is None:
+            company = company_map.get(sheet_symbol)
+
+        # Only companies enabled for both general and Sales monitoring are
+        # present in these Registry maps.
+        if company is None:
+            continue
 
         rows.append(
-            (row, symbol, company_name)
+            (
+                row,
+                company["symbol"],
+                company["company_name"],
+                company["company_id"],
+                company["start_period"],
+            )
         )
 
     return rows
@@ -1018,12 +1282,11 @@ def write_parser_result(ws, row, result):
 
 def load_company_name_map():
     """
-    Build Symbol -> Company Name mapping
-    from AA-TSE-Master.xlsx.
+    Load Sales-enabled companies from AAI-TSE-Master / Companies.
 
-    Cement and MOPFRA:
-    Q = Company Name
-    R = Symbol
+    The header is detected by name so the registry can tolerate leading title
+    rows and column moves. Rows are streamed without relying on ws.max_row,
+    which may be None for read-only workbooks with an incomplete dimension.
     """
 
     if not MASTER_PATH.exists():
@@ -1037,31 +1300,92 @@ def load_company_name_map():
         read_only=True,
     )
 
-    company_map = {}
-    company_by_name = {}
-
-    for sheet_name in ("Cement", "MOPFRA"):
-        if sheet_name not in master_wb.sheetnames:
-            continue
-
-        ws = master_wb[sheet_name]
-
-        for row in range(1, ws.max_row + 1):
-            company_name = normalize_text(
-                ws.cell(row=row, column=17).value
+    try:
+        if "Companies" not in master_wb.sheetnames:
+            raise RuntimeError(
+                "Registry sheet not found: Companies"
             )
 
-            symbol = normalize_text(
-                ws.cell(row=row, column=18).value
-            )
+        company_map = {}
+        company_by_name = {}
+        ws = master_wb["Companies"]
 
-            if not symbol or not company_name:
+        required_headers = {
+            "company_id",
+            "symbol",
+            "company_name",
+            "monitor",
+            "monitor_sales",
+            "start_period",
+        }
+        header_indexes = None
+        header_row_number = None
+        rows_scanned = 0
+        eligible_rows = 0
+        skipped_incomplete = 0
+
+        for row_number, values in enumerate(
+            ws.iter_rows(values_only=True),
+            start=1,
+        ):
+            rows_scanned += 1
+
+            if header_indexes is None:
+                normalized_headers = {
+                    re.sub(r"[\s\-]+", "_", normalize_text(value).casefold()): index
+                    for index, value in enumerate(values)
+                    if normalize_text(value)
+                }
+                if required_headers.issubset(normalized_headers):
+                    header_indexes = normalized_headers
+                    header_row_number = row_number
                 continue
 
-            company_map[symbol] = company_name
-            company_by_name[company_name] = symbol
+            def registry_value(column_name):
+                index = header_indexes[column_name]
+                return values[index] if index < len(values) else None
 
-    master_wb.close()
+            monitor = normalize_text(registry_value("monitor"))
+            monitor_sales = normalize_text(registry_value("monitor_sales"))
+
+            if monitor.casefold() != "yes" or monitor_sales.casefold() != "yes":
+                continue
+
+            eligible_rows += 1
+            company_id = normalize_text(registry_value("company_id"))
+            symbol = normalize_text(registry_value("symbol"))
+            company_name = normalize_text(registry_value("company_name"))
+            start_period = normalize_text(registry_value("start_period"))
+            start_period = normalize_digits(start_period) or HISTORY_START_PERIOD
+            parse_period(start_period)
+
+            if not company_id or not symbol or not company_name:
+                skipped_incomplete += 1
+                continue
+
+            company = {
+                "company_id": company_id,
+                "symbol": symbol,
+                "company_name": company_name,
+                "start_period": start_period,
+            }
+            company_map[symbol] = company
+            company_by_name[company_name] = company
+
+        if header_indexes is None:
+            raise RuntimeError(
+                "Could not find the Companies header row. Required columns: "
+                + ", ".join(sorted(required_headers))
+            )
+
+        print(
+            "Registry summary: "
+            f"header row={header_row_number}, rows scanned={rows_scanned}, "
+            f"Sales-enabled rows={eligible_rows}, companies loaded={len(company_map)}, "
+            f"incomplete rows skipped={skipped_incomplete}."
+        )
+    finally:
+        master_wb.close()
 
     return company_map, company_by_name
 
@@ -1086,7 +1410,7 @@ def save_workbook_safely(wb, path):
 def main():
     print()
     print("=" * 70)
-    print("AA-TSE MONTHLY SALES ENGINE")
+    print("AAI-TSE MONTHLY SALES ENGINE")
     print("=" * 70)
     print()
     print("Select mode:")
@@ -1137,27 +1461,87 @@ def main():
         manual_ws = wb[TEMPLATE_SHEET]
         log_ws = prepare_log_sheet(wb)
         company_map, company_by_name = load_company_name_map()
-        api = CodalAPI()
         parser = MonthlySalesHtmlParser()
 
         print(
             f"{len(company_map)} company names loaded "
-            "from AA-TSE-Master."
+            "from AAI-TSE-Master / Companies."
         )
 
-        date_start, date_end = shared_publish_range(periods)
-        print()
-        print("=" * 70)
-        print("WINDOWED ANNOUNCEMENT RANGE")
-        print(f"{date_start} through {date_end}")
-        print("Requests will be sent one Jalali month at a time.")
-        print("=" * 70)
+        period_work = {}
+        missing_periods = set()
 
-        all_reports = fetch_all_announcements(
-            api,
-            date_start,
-            date_end,
-        )
+        # Refresh from the current template while retaining complete H:N rows
+        # by authoritative Company_ID. New Registry/template companies are
+        # therefore added without re-fetching already valid company-periods.
+        for target_period in periods:
+            auto_sheet_name = period_sheet_name(target_period)
+            existing = {}
+            if auto_sheet_name in wb.sheetnames:
+                existing_ws = wb[auto_sheet_name]
+                existing = existing_sales_by_company(
+                    existing_ws, company_map, company_by_name
+                )
+                del wb[auto_sheet_name]
+
+            auto_ws = wb.create_sheet(auto_sheet_name)
+            copy_sheet_layout(manual_ws, auto_ws)
+            clear_auto_data(auto_ws)
+            symbol_rows = get_symbol_rows(
+                auto_ws, company_map, company_by_name
+            )
+            report_month_column, stale_last_year_column = update_auto_metadata(
+                auto_ws, symbol_rows, target_period
+            )
+            restored = restore_existing_sales(auto_ws, symbol_rows, existing)
+            pending_rows = [
+                item for item in symbol_rows
+                if item[3] not in restored
+                and parse_period(item[4]) <= parse_period(target_period)
+            ]
+            if pending_rows:
+                missing_periods.add(target_period)
+            period_work[target_period] = {
+                "sheet": auto_ws,
+                "sheet_name": auto_sheet_name,
+                "symbol_rows": symbol_rows,
+                "restored": restored,
+                "pending_rows": pending_rows,
+                "report_month_column": report_month_column,
+                "stale_last_year_column": stale_last_year_column,
+            }
+
+        publish_ranges = missing_period_publish_ranges(missing_periods)
+        all_reports = []
+        seen_reports = set()
+        api = None
+        rate_state = {"last_request_at": float("-inf")}
+        prior_year_reports_cache = {}
+        if publish_ranges:
+            api = CodalAPI()
+            print()
+            print("=" * 70)
+            print("INCREMENTAL BACKFILL ANNOUNCEMENT RANGES")
+            for date_start, date_end in publish_ranges:
+                print(f"{date_start} through {date_end}")
+                reports = fetch_all_announcements(
+                    api,
+                    date_start,
+                    date_end,
+                    company_count=len(company_map),
+                    rate_state=rate_state,
+                )
+                for report in reports:
+                    identity = announcement_identity(report)
+                    if identity not in seen_reports:
+                        seen_reports.add(identity)
+                        all_reports.append(report)
+            print("Existing complete Company+Period rows were not fetched.")
+            print("Revision sweep is not part of this backfill mode.")
+            print("=" * 70)
+        else:
+            print("All eligible Company+Period rows already contain valid data.")
+            print("No BRSAPI announcement request is required.")
 
         print(
             "\nDEBUG: total reports fetched =",
@@ -1169,31 +1553,26 @@ def main():
         )
 
         for target_period in periods:
-            auto_sheet_name = period_sheet_name(target_period)
+            work = period_work[target_period]
+            auto_sheet_name = work["sheet_name"]
+            auto_ws = work["sheet"]
+            symbol_rows = work["symbol_rows"]
+            restored = work["restored"]
+            pending_company_ids = {item[3] for item in work["pending_rows"]}
 
             print()
             print("=" * 70)
             print(f"PERIOD: {target_period}")
             print("=" * 70)
 
-            # Recreate this period's Auto sheet every run.
-            if auto_sheet_name in wb.sheetnames:
-                del wb[auto_sheet_name]
-
-            auto_ws = wb.create_sheet(auto_sheet_name)
-            copy_sheet_layout(manual_ws, auto_ws)
-            clear_auto_data(auto_ws)
-
-            symbol_rows = get_symbol_rows(
-                auto_ws,
-                company_by_name,
-            )
             print(f"{len(symbol_rows)} symbol rows found.")
 
             success = 0
             missing = 0
             failed = 0
             revised = 0
+            skipped = 0
+            existing_skipped = 0
             total = len(symbol_rows)
 
             print()
@@ -1201,12 +1580,34 @@ def main():
             print(f"PROCESSING SYMBOLS FOR {target_period}")
             print("=" * 70)
 
-            for index, (row, symbol, company_name) in enumerate(
+            for index, (
+                row,
+                symbol,
+                company_name,
+                company_id,
+                start_period,
+            ) in enumerate(
                 symbol_rows,
                 start=1,
             ):
                 print()
                 print(f"[{index}/{total}] {symbol}")
+
+                if company_id in restored:
+                    print("  SKIPPED: valid existing Company+Period data")
+                    existing_skipped += 1
+                    continue
+
+                if parse_period(start_period) > parse_period(target_period):
+                    print(
+                        f"  SKIPPED: Company_ID {company_id} starts at "
+                        f"{start_period}, after target period {target_period}."
+                    )
+                    skipped += 1
+                    continue
+
+                if company_id not in pending_company_ids:
+                    continue
 
                 report, report_count = select_latest_report(
                     all_reports,
@@ -1244,6 +1645,23 @@ def main():
                         target_period,
                     )
                     parsed = parser.parse(html)
+                    fallback_status, prior_report, fallback_message = (
+                        apply_prior_year_sales_fallback(
+                            parsed,
+                            symbol,
+                            company_name,
+                            target_period,
+                            parser,
+                            api,
+                            len(company_map),
+                            rate_state,
+                            prior_year_reports_cache,
+                        )
+                    )
+                    if fallback_status == "FILLED":
+                        print("  PRIOR-YEAR FALLBACK FILLED:", fallback_message)
+                    elif fallback_status != "NOT_NEEDED":
+                        print("  PRIOR-YEAR FALLBACK UNAVAILABLE:", fallback_message)
                     write_parser_result(auto_ws, row, parsed)
 
                     status = (
@@ -1259,6 +1677,7 @@ def main():
                         report=report,
                         report_count=report_count,
                         html_path=html_path,
+                        message=fallback_message or "",
                     )
                     success += 1
 
@@ -1289,11 +1708,13 @@ def main():
 
             print()
             print("=" * 70)
-            print(f"AA-TSE BATCH SUMMARY: {target_period}")
+            print(f"AAI-TSE BATCH SUMMARY: {target_period}")
             print("=" * 70)
             print("Symbols        :", total)
             print("Success        :", success)
             print("Missing report :", missing)
+            print("Before start    :", skipped)
+            print("Existing valid :", existing_skipped)
             print("Parse failed   :", failed)
             print("Multiple/revised candidates:", revised)
             print("Workbook saved :", WORKBOOK_PATH)
