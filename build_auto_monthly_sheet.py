@@ -1,13 +1,18 @@
 from copy import copy
 from datetime import date, datetime
 from email.utils import parsedate_to_datetime
+from html import unescape
+from html.parser import HTMLParser
 import os
 from pathlib import Path
 import re
 import time
+from urllib.parse import urljoin
 
 import requests
-from openpyxl import load_workbook 
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.views import Selection
 
 from api.codal_api import CodalAPI
 from services.monthly_sales_html_parser import MonthlySalesHtmlParser
@@ -32,6 +37,17 @@ BRSAPI_MAX_429_RETRIES = 8
 BRSAPI_INITIAL_BACKOFF = 5.0
 BRSAPI_MAX_BACKOFF = 120.0
 
+# Recovery queries are symbol-filtered and normally finish on page one.  Keep a
+# hard safety ceiling in case an upstream API ignores the symbol parameter.
+TARGETED_RECOVERY_MAX_PAGES = 20
+REVISION_CHAIN_MAX_HOPS = 20
+
+# Prefer one symbol-filtered query path when a period has only a small number
+# of gaps.  Either limit is sufficient: at most 10 rows, or less than 20% of
+# the companies eligible for that period.  Larger gaps keep the batch path.
+TARGETED_ONLY_MAX_ROWS = 10
+TARGETED_ONLY_MAX_RATIO = 0.20
+
 # Historical range we ultimately want to backfill
 HISTORY_START_PERIOD = "1404/01/31"
 HISTORY_END_PERIOD = "1405/04/31"
@@ -40,6 +56,42 @@ OUTPUT_HTML_DIR = Path("output/monthly_html")
 OUTPUT_HTML_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_SHEET = "_Report_Log"
+SALES_TREND_SHEET = "Sales Trend"
+
+AUTO_SCHEMA = (
+    ("Company_ID", None),
+    ("Company_Name", None),
+    ("Symbol", None),
+    ("Fiscal_Year_End", None),
+    ("Report_Month", None),
+    ("Reporting_Period_Months", None),
+    ("Sales_Prior_Year_YTD", "sales_last_year"),
+    ("Sales_YTD", "sales_ytd"),
+    ("Sales_Month", "sales_month"),
+    ("Sales_Prior_Month_YTD", "sales_prior_month_ytd"),
+    ("Export_Prior_Year_YTD", "export_last_year"),
+    ("Export_YTD", "export_ytd"),
+    ("Export_Month", "export_month"),
+)
+AUTO_HEADERS = tuple(header for header, _ in AUTO_SCHEMA)
+SALES_HEADERS = {
+    parser_key: header
+    for header, parser_key in AUTO_SCHEMA
+    if parser_key is not None
+}
+
+# The workbook produced before AUTO_SCHEMA was introduced always stored the
+# seven parser values in H:N.  Keep this mapping in one migration-only place;
+# normal reads and all new writes remain header based.
+LEGACY_SALES_COLUMNS = {
+    "Sales_Prior_Year_YTD": 8,
+    "Sales_YTD": 9,
+    "Sales_Month": 10,
+    "Sales_Prior_Month_YTD": 11,
+    "Export_Prior_Year_YTD": 12,
+    "Export_YTD": 13,
+    "Export_Month": 14,
+}
 
 
 # ============================================================
@@ -226,6 +278,19 @@ def gregorian_to_jalali(year, month, day):
         jalali_month += 1
 
     return jalali_year, jalali_month + 1, jalali_day_number + 1
+
+
+def title_contains_period(title, target_period):
+    """Match a Jalali period even when CODAL omits leading zeroes."""
+    target = parse_period(target_period)
+    normalized_title = normalize_digits(normalize_text(title))
+    for year, month, day in re.findall(
+        r"(?<!\d)(1[34]\d{2})\s*[/-]\s*(\d{1,2})\s*[/-]\s*(\d{1,2})(?!\d)",
+        normalized_title,
+    ):
+        if (int(year), int(month), int(day)) == target:
+            return True
+    return False
 
 
 def prior_year_period(period):
@@ -696,7 +761,7 @@ def report_matches_symbol_and_period(
 
     return (
         report_symbol == target_symbol
-        and target_period in title
+        and title_contains_period(title, target_period)
         and is_monthly_activity_report(report)
     )
 
@@ -733,7 +798,7 @@ def report_matches_company_and_period(
 
     return (
         target_company in record_text
-        and target_period in title
+        and title_contains_period(title, target_period)
         and is_monthly_activity_report(report)
     )
 
@@ -798,44 +863,274 @@ def select_latest_report(
     return candidates[-1], len(candidates)
 
 
+def missing_report_recovery_range(target_period, include_normal_window=False):
+    """Return only the late-publication range not covered by batch backfill.
+
+    In BATCH mode the normal next-month publication window has already been
+    fetched, so recovery starts after it.  In TARGETED_ONLY mode there was no
+    general fetch, so the symbol-filtered search includes the normal window.
+    """
+    normal_start, normal_end = publish_range_for_period(target_period)
+    if include_normal_window:
+        today_year, today_month, today_day = today_jalali()
+        date_end = f"{today_year:04d}-{today_month:02d}-{today_day:02d}"
+        if normal_start > date_end:
+            return None
+        return normal_start, date_end
+
+    normal_year, normal_month, _ = parse_period(normal_end)
+    recovery_year, recovery_month = next_jalali_month(normal_year, normal_month)
+    date_start = f"{recovery_year:04d}-{recovery_month:02d}-01"
+    today_year, today_month, today_day = today_jalali()
+    date_end = f"{today_year:04d}-{today_month:02d}-{today_day:02d}"
+    if date_start > date_end:
+        return None
+    return date_start, date_end
+
+
+def recover_missing_report(
+    api,
+    symbol,
+    company_name,
+    target_period,
+    rate_state,
+    recovery_reports_cache,
+    include_normal_window=False,
+):
+    """Find one missing Company+Period using only symbol-filtered API calls.
+
+    Late publication months are searched chronologically after the normal
+    batch window.  Every report is checked immediately and the function returns
+    on the first valid monthly report for the target period.  Any newer version
+    is resolved later through the explicit revision link in that report's HTML,
+    rather than by continuing the announcement search.  This function never
+    downloads category=3 results for unrelated companies.
+    """
+    recovery_range = missing_report_recovery_range(
+        target_period,
+        include_normal_window=include_normal_window,
+    )
+    if recovery_range is None:
+        return None, 0
+
+    cache_key = (normalize_text(symbol), target_period)
+    if cache_key in recovery_reports_cache:
+        print("  MISSING REPORT RECOVERY: using cached targeted result")
+        return recovery_reports_cache[cache_key]
+
+    date_start, date_end = recovery_range
+    print(
+        "  MISSING REPORT RECOVERY: targeted search | "
+        f"symbol={symbol} | period={target_period}"
+    )
+    seen = set()
+    for window_start, window_end in monthly_publish_windows(date_start, date_end):
+        print(f"    Publish window: {window_start} through {window_end}")
+        previous_page_signature = None
+        for page in range(1, TARGETED_RECOVERY_MAX_PAGES + 1):
+            data = _get_announcements_with_retry(
+                api,
+                {
+                    "category": CATEGORY,
+                    "symbol": symbol,
+                    "date_start": window_start,
+                    "date_end": window_end,
+                    "page": page,
+                },
+                rate_state,
+            )
+            reports = data.get("announcement", []) or []
+            print(f"      Page {page}: {len(reports)} symbol-filtered result(s)")
+            if not reports:
+                break
+
+            page_signature = tuple(announcement_identity(item) for item in reports)
+            if page_signature == previous_page_signature:
+                print("      Repeated page detected; moving to next month.")
+                break
+            previous_page_signature = page_signature
+
+            for report in reports:
+                identity = announcement_identity(report)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if (
+                    report_matches_symbol_and_period(report, symbol, target_period)
+                    or report_matches_company_and_period(
+                        report, company_name, target_period
+                    )
+                ):
+                    result = (report, 1)
+                    recovery_reports_cache[cache_key] = result
+                    print(
+                        "      Valid target report found; recovery search stopped."
+                    )
+                    return result
+
+            count_page = (
+                data.get("count_page") or data.get("countPage")
+                or data.get("total_pages") or data.get("totalPages")
+            )
+            try:
+                if count_page is not None and page >= int(count_page):
+                    break
+            except (TypeError, ValueError):
+                pass
+        else:
+            print(
+                "      WARNING: targeted pagination safety limit reached; "
+                "moving to next month."
+            )
+
+    result = (None, 0)
+    recovery_reports_cache[cache_key] = result
+    return result
+
+
 # ============================================================
-# HTML DOWNLOAD
+# HTML DOWNLOAD / REVISION RESOLUTION
 # ============================================================
 
-def download_html(report, symbol, target_period):
-    url = report.get("link")
+class _RevisionLinkParser(HTMLParser):
+    """Collect anchor text plus nearby text used by CODAL's revision banner."""
 
-    if not url:
-        raise RuntimeError(
-            f"No HTML link for {symbol}"
-        )
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.recent_text = ""
+        self.current = None
+        self.links = []
 
-    response = requests.get(
-        url,
-        timeout=30,
+    def handle_starttag(self, tag, attrs):
+        if tag.casefold() != "a":
+            return
+        attributes = dict(attrs)
+        self.current = {
+            "href": attributes.get("href", ""),
+            "text": "",
+            "context_before": self.recent_text[-240:],
+            "attributes": " ".join(str(value) for _key, value in attrs if value),
+        }
+
+    def handle_data(self, data):
+        self.recent_text = (self.recent_text + " " + data)[-800:]
+        if self.current is not None:
+            self.current["text"] += " " + data
+
+    def handle_endtag(self, tag):
+        if tag.casefold() == "a" and self.current is not None:
+            self.links.append(self.current)
+            self.current = None
+
+
+def _extract_url_from_href(href):
+    """Accept ordinary links and common javascript window/open wrappers."""
+    href = unescape(str(href or "")).strip()
+    if not href:
+        return None
+    if not href.casefold().startswith("javascript:"):
+        return href
+    match = re.search(r"['\"]([^'\"]+(?:LetterSerial|TracingNo|Report|Reports)[^'\"]*)['\"]", href, re.I)
+    return match.group(1) if match else None
+
+
+def find_newer_revision_link(html, current_url):
+    """Return CODAL's explicit newer-version link, never its older link."""
+    parser = _RevisionLinkParser()
+    parser.feed(html)
+    newer_hints = (
+        "اطلاعیه جدیدتر", "نسخه جدیدتر", "گزارش جدیدتر",
+        "اطلاعیه بعدی", "نسخه بعدی", "اصلاحیه جدید",
     )
-
-    response.raise_for_status()
-    response.encoding = "utf-8"
-
-    safe_symbol = (
-        symbol
-        .replace("/", "_")
-        .replace("\\", "_")
+    older_hints = (
+        "اطلاعیه قبلی", "نسخه قبلی", "گزارش قبلی", "اطلاعیه پیشین",
+        "نسخه قدیمی", "قدیمی تر", "قدیمی‌تر",
     )
+    for link in parser.links:
+        # The banner sentence may precede the clickable words, so include a
+        # bounded amount of adjacent text and link attributes in the decision.
+        context = normalize_text(" ".join((
+            link.get("context_before", ""), link.get("text", ""),
+            link.get("attributes", ""),
+        )))
+        newest_newer_hint = max((context.rfind(hint) for hint in newer_hints), default=-1)
+        newest_older_hint = max((context.rfind(hint) for hint in older_hints), default=-1)
+        if newest_newer_hint < 0 or newest_newer_hint < newest_older_hint:
+            continue
+        href = _extract_url_from_href(link.get("href"))
+        if href:
+            resolved = urljoin(current_url, href)
+            if resolved != current_url:
+                return resolved
+    return None
 
-    path = (
-        OUTPUT_HTML_DIR
-        / f"{safe_symbol}_{period_html_suffix(target_period)}.html"
-    )
 
-    path.write_text(
-        response.text,
-        encoding="utf-8",
-    )
+def _get_html_with_retry(url, rate_state):
+    """Pace CODAL HTML requests and retry explicit HTTP 429 responses."""
+    retries = 0
+    while True:
+        elapsed = time.monotonic() - rate_state["last_request_at"]
+        if elapsed < BRSAPI_MIN_REQUEST_INTERVAL:
+            time.sleep(BRSAPI_MIN_REQUEST_INTERVAL - elapsed)
+        rate_state["last_request_at"] = time.monotonic()
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            return response.text
+        except requests.HTTPError as error:
+            if not _is_rate_limit_error(error) or retries >= BRSAPI_MAX_429_RETRIES:
+                raise
+            retry_after = _retry_after_seconds(error)
+            backoff = min(
+                BRSAPI_INITIAL_BACKOFF * (2 ** retries), BRSAPI_MAX_BACKOFF
+            )
+            wait_seconds = max(
+                retry_after if retry_after is not None else backoff,
+                BRSAPI_MIN_REQUEST_INTERVAL,
+            )
+            retries += 1
+            print(
+                f"  CODAL HTML rate limit (429); waiting {wait_seconds:.1f}s "
+                f"before retry {retries}/{BRSAPI_MAX_429_RETRIES}."
+            )
+            time.sleep(wait_seconds)
 
-    return response.text, path
 
+def _write_report_html(html, symbol, target_period):
+    safe_symbol = symbol.replace("/", "_").replace("\\", "_")
+    path = OUTPUT_HTML_DIR / f"{safe_symbol}_{period_html_suffix(target_period)}.html"
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+def resolve_latest_revision(report, symbol, target_period, rate_state):
+    """Follow explicit CODAL newer-version links and return the terminal HTML."""
+    current_report = dict(report)
+    current_url = current_report.get("link")
+    if not current_url:
+        raise RuntimeError(f"No HTML link for {symbol}")
+
+    visited = set()
+    hops = 0
+    while True:
+        if current_url in visited:
+            raise RuntimeError(f"Revision link cycle detected for {symbol}")
+        visited.add(current_url)
+        html = _get_html_with_retry(current_url, rate_state)
+        newer_url = find_newer_revision_link(html, current_url)
+        if not newer_url:
+            path = _write_report_html(html, symbol, target_period)
+            return current_report, html, path, hops
+        hops += 1
+        if hops > REVISION_CHAIN_MAX_HOPS:
+            raise RuntimeError(
+                f"Revision chain exceeded {REVISION_CHAIN_MAX_HOPS} hops for {symbol}"
+            )
+        print(f"  REVISION RESOLVER: following newer version ({hops})")
+        current_url = newer_url
+        current_report = dict(current_report)
+        current_report["link"] = current_url
 
 def apply_prior_year_sales_fallback(
     parsed,
@@ -885,8 +1180,10 @@ def apply_prior_year_sales_fallback(
         )
 
     try:
-        prior_html, prior_html_path = download_html(
-            prior_report, symbol, fallback_period
+        prior_report, prior_html, prior_html_path, prior_revision_hops = (
+            resolve_latest_revision(
+                prior_report, symbol, fallback_period, rate_state
+            )
         )
         prior_parsed = parser.parse(prior_html)
     except Exception as error:
@@ -904,8 +1201,9 @@ def apply_prior_year_sales_fallback(
 
     parsed["sales_last_year"] = prior_sales_ytd
     revision_note = (
-        f"; latest of {prior_report_count} prior-year candidates selected"
-        if prior_report_count > 1 else ""
+        f"; latest revision selected ({prior_report_count} search candidate(s), "
+        f"{prior_revision_hops} HTML chain hop(s))"
+        if prior_report_count > 1 or prior_revision_hops else ""
     )
     return "FILLED", prior_report, (
         f"sales_last_year filled from {fallback_period} sales_ytd"
@@ -916,6 +1214,15 @@ def apply_prior_year_sales_fallback(
 # ============================================================
 # EXCEL HELPERS
 # ============================================================
+
+def reset_worksheet_view(ws):
+    """Give Auto sheets a valid, unfrozen Excel worksheet view."""
+    ws.freeze_panes = None
+    ws.sheet_view.pane = None
+    ws.sheet_view.selection = [
+        Selection(pane=None, activeCell="A1", sqref="A1")
+    ]
+
 
 def copy_sheet_layout(source_ws, target_ws):
     """
@@ -999,121 +1306,305 @@ def copy_sheet_layout(source_ws, target_ws):
         source_ws.sheet_view.showGridLines
     )
 
-    target_ws.freeze_panes = (
-        source_ws.freeze_panes
-    )
+    reset_worksheet_view(target_ws)
 
 
-def clear_auto_data(ws):
-    """
-    H:N must be generated by the program, not copied from Manual.
-    """
-
-    for row in range(1, ws.max_row + 1):
-        for col in range(8, 15):
-            ws.cell(
-                row=row,
-                column=col,
-            ).value = None
+def _header_token(value):
+    return re.sub(
+        r"[\s_\-]+", "", normalize_digits(normalize_text(value))
+    ).casefold()
 
 
-def _metadata_column(ws, accepted_labels):
-    """Find a metadata header in A:G without ever touching H:N outputs."""
-    normalized_labels = {
-        re.sub(r"[\s_\-]+", "", normalize_digits(normalize_text(label))).casefold()
-        for label in accepted_labels
+HEADER_ALIASES = {
+    "Company_ID": ("Company_ID", "Company ID", "کد شرکت"),
+    "Company_Name": ("Company_Name", "Company Name", "نام شرکت"),
+    "Symbol": ("Symbol", "نماد"),
+    "Fiscal_Year_End": (
+        "Fiscal_Year_End", "Fiscal Year End", "ماه سال مالی", "پایان سال مالی",
+    ),
+    "Report_Month": ("Report_Month", "Report Month", "ماه گزارش"),
+    "Reporting_Period_Months": (
+        "Reporting_Period_Months", "Reporting Period Months",
+        "تعداد ماه دوره گزارش", "دوره گزارش",
+    ),
+    "Sales_Prior_Year_YTD": (
+        "Sales_Prior_Year_YTD", "Sales Last Year", "sales_last_year",
+        "فروش دوره مشابه سال قبل",
+    ),
+    "Sales_YTD": ("Sales_YTD", "Sales YTD", "sales_ytd", "فروش تجمعی"),
+    "Sales_Month": ("Sales_Month", "Sales Month", "sales_month", "فروش ماه"),
+    "Sales_Prior_Month_YTD": (
+        "Sales_Prior_Month_YTD", "Sales Prior Month YTD",
+        "sales_prior_month_ytd", "فروش تجمعی ماه قبل",
+    ),
+    "Export_Prior_Year_YTD": (
+        "Export_Prior_Year_YTD", "Export Last Year", "export_last_year",
+        "صادرات دوره مشابه سال قبل",
+    ),
+    "Export_YTD": ("Export_YTD", "Export YTD", "export_ytd", "صادرات تجمعی"),
+    "Export_Month": ("Export_Month", "Export Month", "export_month", "صادرات ماه"),
+}
+
+
+def find_header_map(ws, required=()):
+    """Return (header row, canonical header -> column) for an Auto-like sheet."""
+    aliases = {
+        canonical: {_header_token(label) for label in labels}
+        for canonical, labels in HEADER_ALIASES.items()
     }
-    for row in range(1, ws.max_row + 1):
-        for column in range(1, 8):
-            value = ws.cell(row=row, column=column).value
-            if value is None or str(value).startswith("="):
+    best = None
+    for row in range(1, min(ws.max_row, 40) + 1):
+        found = {}
+        for column in range(1, min(max(ws.max_column, len(AUTO_HEADERS)), 40) + 1):
+            token = _header_token(ws.cell(row=row, column=column).value)
+            if not token:
                 continue
-            normalized = re.sub(
-                r"[\s_\-]+", "", normalize_digits(normalize_text(value))
-            ).casefold()
-            if normalized in normalized_labels:
-                return column
-    return None
+            for canonical, accepted in aliases.items():
+                if token in accepted and canonical not in found:
+                    found[canonical] = column
+        candidate = (len(found), row, found)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    available = best[2] if best else {}
+    missing = set(required) - set(available)
+    if missing:
+        raise RuntimeError("Auto header row is missing: " + ", ".join(sorted(missing)))
+    return best[1], available
 
 
-def update_auto_metadata(ws, symbol_rows, target_period):
-    """Refresh period metadata while preserving template formulas (notably G)."""
-    report_month_column = _metadata_column(
-        ws, ("ماه گزارش", "Report Month", "report_month")
+def clear_auto_data(ws, header_map, header_row):
+    """Clear parser outputs by stable header name, never by Excel letter."""
+    for column in (header_map[header] for header in SALES_HEADERS.values()):
+        for row in range(header_row + 1, ws.max_row + 1):
+            ws.cell(row=row, column=column).value = None
+
+
+def standardize_auto_schema(ws, company_map, company_by_name, target_period):
+    """Rewrite the copied Template to the fixed schema while preserving formulas."""
+    header_row, old_map = find_header_map(
+        ws,
+        required=(
+            "Company_Name", "Symbol", "Report_Month",
+            "Reporting_Period_Months",
+        ),
     )
-    stale_last_year_column = _metadata_column(
-        ws, ("فروش سال قبل", "Prior Year Sales", "Last Year Sales")
-    )
+    required_sales = set(SALES_HEADERS.values())
+    if required_sales.issubset(old_map):
+        sales_map = {header: old_map[header] for header in required_sales}
+    else:
+        legacy = legacy_auto_header_map(ws, header_row=header_row)
+        if legacy is None:
+            missing = sorted(required_sales - set(old_map))
+            raise RuntimeError(
+                "Auto sales columns are neither canonical nor a valid legacy "
+                "H:N layout; missing: " + ", ".join(missing)
+            )
+        _legacy_header_row, legacy_map = legacy
+        sales_map = {
+            header: legacy_map[header]
+            for header in required_sales
+        }
 
-    if report_month_column is None:
-        raise RuntimeError("Report Month metadata header was not found in A:G.")
+    # Metadata is discovered from its aliases; parser values come from either
+    # the complete canonical block or the validated historical H:N block.
+    # Snapshot everything before overwriting columns because the two layouts
+    # overlap in different positions.
+    source_by_target = {
+        header: sales_map.get(header, old_map.get(header))
+        for header in AUTO_HEADERS
+        if header != "Company_ID"
+    }
+    snapshots = {}
+    original_max_row = ws.max_row
+    for header, source_column in source_by_target.items():
+        if source_column is None:
+            continue
+        snapshots[header] = [
+            (ws.cell(row=row, column=source_column).value,
+             copy(ws.cell(row=row, column=source_column)._style))
+            for row in range(1, original_max_row + 1)
+        ]
 
+    old_max_column = ws.max_column
+    for target_column, header in enumerate(AUTO_HEADERS, start=1):
+        source_column = source_by_target.get(header)
+        snapshot = snapshots.get(header)
+        for row in range(1, original_max_row + 1):
+            cell = ws.cell(row=row, column=target_column)
+            if snapshot is not None:
+                cell.value, cell._style = snapshot[row - 1]
+            elif header == "Company_ID":
+                cell._style = copy(
+                    ws.cell(row=row, column=old_map["Company_Name"])._style
+                )
+                cell.value = None
+        ws.cell(row=header_row, column=target_column).value = header
+        if source_column is not None:
+            source_letter = get_column_letter(source_column)
+            target_letter = get_column_letter(target_column)
+            ws.column_dimensions[target_letter].width = (
+                ws.column_dimensions[source_letter].width
+            )
+
+    if old_max_column > len(AUTO_HEADERS):
+        ws.delete_cols(len(AUTO_HEADERS) + 1, old_max_column - len(AUTO_HEADERS))
+
+    header_map = {header: column for column, header in enumerate(AUTO_HEADERS, 1)}
+    symbol_rows = get_symbol_rows(ws, company_map, company_by_name, header_map)
     report_month = parse_period(target_period)[1]
-    for row, *_ in symbol_rows:
-        ws.cell(row=row, column=report_month_column).value = report_month
-        if stale_last_year_column is not None:
-            ws.cell(row=row, column=stale_last_year_column).value = None
+    fiscal_year_column = get_column_letter(header_map["Fiscal_Year_End"])
+    report_month_column = get_column_letter(header_map["Report_Month"])
+    for row, _symbol, _name, company_id, _start_period in symbol_rows:
+        ws.cell(row=row, column=header_map["Company_ID"]).value = company_id
+        ws.cell(row=row, column=header_map["Report_Month"]).value = report_month
+        ws.cell(
+            row=row,
+            column=header_map["Reporting_Period_Months"],
+        ).value = (
+            f"=IF({report_month_column}{row}>{fiscal_year_column}{row},"
+            f"({report_month_column}{row}-{fiscal_year_column}{row}),"
+            f"((12-{fiscal_year_column}{row})+{report_month_column}{row}))"
+        )
+    return header_row, header_map, symbol_rows
 
-    return report_month_column, stale_last_year_column
 
-
-def row_has_valid_sales_data(ws, row):
-    """A completed parser write always populates every H:N output cell."""
+def row_has_valid_sales_data(ws, row, header_map):
     return all(
-        ws.cell(row=row, column=column).value is not None
-        for column in range(8, 15)
+        ws.cell(row=row, column=header_map[header]).value is not None
+        for header in SALES_HEADERS.values()
     )
+
+
+def legacy_auto_header_map(ws, header_row=None):
+    """Return a safe H:N migration map, or None for an unknown old layout."""
+    try:
+        discovered_row, identity_map = find_header_map(
+            ws, required=("Company_Name", "Symbol")
+        )
+    except RuntimeError:
+        return None
+    if header_row is not None and discovered_row != header_row:
+        return None
+    header_row = discovered_row
+
+    # H:N is only safe when it actually looks like the historical Auto block.
+    # Some early Auto sheets lost the seven visible H:N captions while retaining
+    # complete parser data underneath them.  Accept that exact legacy case only
+    # for an Auto sheet with the original B:G identity layout and several fully
+    # populated H:N data rows.  This keeps migration strict for unknown sheets.
+    if ws.max_column < 14:
+        return None
+    legacy_headers = [ws.cell(header_row, column).value for column in range(8, 15)]
+
+    recognized = sum(
+        _header_token(ws.cell(header_row, column).value)
+        in {_header_token(label) for label in HEADER_ALIASES[canonical]}
+        for canonical, column in LEGACY_SALES_COLUMNS.items()
+    )
+    headers_populated = all(normalize_text(value) for value in legacy_headers)
+    if not (headers_populated and recognized >= 2):
+        blank_headers = all(not normalize_text(value) for value in legacy_headers)
+        consistent_header_state = blank_headers or headers_populated
+        original_identity_layout = (
+            ws.title.startswith("Auto ")
+            and identity_map.get("Company_Name") == 2
+            and identity_map.get("Symbol") == 3
+            and identity_map.get("Report_Month") == 6
+            and identity_map.get("Reporting_Period_Months") == 7
+        )
+        complete_legacy_rows = sum(
+            all(ws.cell(row=row, column=column).value is not None
+                for column in range(8, 15))
+            for row in range(header_row + 1, ws.max_row + 1)
+        )
+        if not (
+            consistent_header_state
+            and original_identity_layout
+            and complete_legacy_rows >= 3
+        ):
+            return None
+
+    return header_row, {
+        **identity_map,
+        **LEGACY_SALES_COLUMNS,
+    }
 
 
 def existing_sales_by_company(ws, company_map, company_by_name):
-    """Capture valid H:N data using authoritative Company_ID as the key."""
+    """Capture valid values from either canonical or recognized legacy Auto."""
+    _header_row, discovered = find_header_map(ws)
+    required_sales = set(SALES_HEADERS.values())
+    if {"Company_Name", "Symbol", *required_sales}.issubset(discovered):
+        header_map = discovered
+        source_schema = "canonical"
+    else:
+        legacy = legacy_auto_header_map(ws)
+        if legacy is None:
+            print(
+                f"WARNING: {ws.title}: existing Auto schema is not recognized; "
+                "old values will not be preserved and the sheet will be rebuilt."
+            )
+            return {}
+        _header_row, header_map = legacy
+        source_schema = "legacy H:N"
+
     existing = {}
     for row, _symbol, _name, company_id, _start_period in get_symbol_rows(
-        ws, company_map, company_by_name
+        ws, company_map, company_by_name, header_map
     ):
-        if row_has_valid_sales_data(ws, row):
-            existing[company_id] = tuple(
-                ws.cell(row=row, column=column).value
-                for column in range(8, 15)
-            )
+        if row_has_valid_sales_data(ws, row, header_map):
+            existing[company_id] = {
+                header: ws.cell(row=row, column=header_map[header]).value
+                for header in SALES_HEADERS.values()
+            }
+    print(
+        f"Migration: {ws.title}: preserved {len(existing)} complete row(s) "
+        f"from {source_schema} schema."
+    )
     return existing
 
 
-def restore_existing_sales(ws, symbol_rows, existing):
-    """Restore valid values after refreshing the sheet from the template."""
+def restore_existing_sales(ws, symbol_rows, existing, header_map):
     restored = set()
     for row, _symbol, _name, company_id, _start_period in symbol_rows:
         values = existing.get(company_id)
         if values is None:
             continue
-        for column, value in enumerate(values, start=8):
-            ws.cell(row=row, column=column).value = value
+        for header, value in values.items():
+            ws.cell(row=row, column=header_map[header]).value = value
         restored.add(company_id)
     return restored
 
 
-def get_symbol_rows(ws, company_map, company_by_name):
+def get_symbol_rows(ws, company_map, company_by_name, header_map=None):
     """
-    Column B = Company Name.
-    Column C = Symbol.
-
-    Company Name or Symbol is used to obtain the authoritative company
-    record from AAI-TSE-Master / Companies.
+    Columns are located by header. Company_ID is authoritative when present;
+    legacy sheets can still be migrated via registry name/symbol lookup.
 
     Skip empty rows and header rows automatically.
     """
 
+    if header_map is None:
+        _header_row, header_map = find_header_map(
+            ws, required=("Company_Name", "Symbol")
+        )
+    company_name_column = header_map["Company_Name"]
+    symbol_column = header_map["Symbol"]
+    company_id_column = header_map.get("Company_ID")
+    companies_by_id = {
+        company["company_id"]: company for company in company_map.values()
+    }
     rows = []
 
     for row in range(1, ws.max_row + 1):
         raw_company_name = ws.cell(
             row=row,
-            column=2,
+            column=company_name_column,
         ).value
 
         raw_symbol = ws.cell(
             row=row,
-            column=3,
+            column=symbol_column,
         ).value
 
         company_name = normalize_text(raw_company_name)
@@ -1129,7 +1620,12 @@ def get_symbol_rows(ws, company_map, company_by_name):
         ):
             continue
 
-        company = company_by_name.get(company_name)
+        company = None
+        if company_id_column is not None:
+            company = companies_by_id.get(normalize_text(
+                ws.cell(row=row, column=company_id_column).value
+            ))
+        company = company or company_by_name.get(company_name)
         if company is None:
             company = company_map.get(sheet_symbol)
 
@@ -1239,46 +1735,10 @@ def log_result(
 # EXCEL FIELD MAPPING
 # ============================================================
 
-def write_parser_result(ws, row, result):
-    """
-    H:N mapping.
-
-    H = sales last year
-    I = sales YTD
-    J = sales current month
-    K = sales prior month YTD
-    L = export last year
-    M = export YTD
-    N = export current month
-    """
-
-    ws.cell(row=row, column=8).value = (
-        result["sales_last_year"]
-    )
-
-    ws.cell(row=row, column=9).value = (
-        result["sales_ytd"]
-    )
-
-    ws.cell(row=row, column=10).value = (
-        result["sales_month"]
-    )
-
-    ws.cell(row=row, column=11).value = (
-        result["sales_prior_month_ytd"]
-    )
-
-    ws.cell(row=row, column=12).value = (
-        result["export_last_year"]
-    )
-
-    ws.cell(row=row, column=13).value = (
-        result["export_ytd"]
-    )
-
-    ws.cell(row=row, column=14).value = (
-        result["export_month"]
-    )
+def write_parser_result(ws, row, result, header_map):
+    """Write parser fields through the stable public header contract."""
+    for parser_key, header in SALES_HEADERS.items():
+        ws.cell(row=row, column=header_map[header]).value = result[parser_key]
 
 def load_company_name_map():
     """
@@ -1407,6 +1867,30 @@ def save_workbook_safely(wb, path):
             temporary_path.unlink()
 
 
+def assert_no_external_formulas(wb):
+    """Refuse to save dangling [book]Sheet! formulas that trigger Excel repair."""
+    problems = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                value = cell.value
+                if isinstance(value, str) and value.startswith("=") and re.search(
+                    r"\[[^\]]+\]", value
+                ):
+                    problems.append(f"{ws.title}!{cell.coordinate}")
+                    if len(problems) >= 20:
+                        break
+            if len(problems) >= 20:
+                break
+        if len(problems) >= 20:
+            break
+    if problems:
+        raise RuntimeError(
+            "External workbook formulas remain; workbook was not saved. "
+            "First cells: " + ", ".join(problems)
+        )
+
+
 def main():
     print()
     print("=" * 70)
@@ -1451,8 +1935,16 @@ def main():
     if not WORKBOOK_PATH.exists():
         raise FileNotFoundError(f"Workbook not found: {WORKBOOK_PATH}")
 
-    wb = load_workbook(WORKBOOK_PATH)
+    wb = load_workbook(
+        WORKBOOK_PATH,
+        keep_links=False,
+    )
     try:
+        # The user-cleaned baseline must stay link-free.  Check before any
+        # mutation and again immediately before the atomic save.
+        assert_no_external_formulas(wb)
+        if SALES_TREND_SHEET not in wb.sheetnames:
+            raise RuntimeError(f"Required sheet not found: {SALES_TREND_SHEET}")
         if TEMPLATE_SHEET not in wb.sheetnames:
             raise RuntimeError(
                 f"Template sheet not found: {TEMPLATE_SHEET}"
@@ -1469,10 +1961,10 @@ def main():
         )
 
         period_work = {}
-        missing_periods = set()
+        batch_periods = set()
 
-        # Refresh from the current template while retaining complete H:N rows
-        # by authoritative Company_ID. New Registry/template companies are
+        # Refresh from the current template while retaining complete named
+        # sales fields by authoritative Company_ID. New Registry companies are
         # therefore added without re-fetching already valid company-periods.
         for target_period in periods:
             auto_sheet_name = period_sheet_name(target_period)
@@ -1486,39 +1978,70 @@ def main():
 
             auto_ws = wb.create_sheet(auto_sheet_name)
             copy_sheet_layout(manual_ws, auto_ws)
-            clear_auto_data(auto_ws)
-            symbol_rows = get_symbol_rows(
-                auto_ws, company_map, company_by_name
+            header_row, header_map, symbol_rows = standardize_auto_schema(
+                auto_ws, company_map, company_by_name, target_period
             )
-            report_month_column, stale_last_year_column = update_auto_metadata(
-                auto_ws, symbol_rows, target_period
+            reset_worksheet_view(auto_ws)
+            clear_auto_data(auto_ws, header_map, header_row)
+            restored = restore_existing_sales(
+                auto_ws, symbol_rows, existing, header_map
             )
-            restored = restore_existing_sales(auto_ws, symbol_rows, existing)
             pending_rows = [
                 item for item in symbol_rows
                 if item[3] not in restored
                 and parse_period(item[4]) <= parse_period(target_period)
             ]
-            if pending_rows:
-                missing_periods.add(target_period)
+            eligible_count = sum(
+                1
+                for item in symbol_rows
+                if parse_period(item[4]) <= parse_period(target_period)
+            )
+            missing_count = len(pending_rows)
+            missing_ratio = (
+                missing_count / eligible_count if eligible_count else 0.0
+            )
+            if not pending_rows:
+                fetch_strategy = "NONE"
+            elif (
+                missing_count <= TARGETED_ONLY_MAX_ROWS
+                or missing_ratio < TARGETED_ONLY_MAX_RATIO
+            ):
+                fetch_strategy = "TARGETED_ONLY"
+            else:
+                fetch_strategy = "BATCH"
+                batch_periods.add(target_period)
+
+            print(
+                f"PRE-FETCH STRATEGY: {target_period} | {fetch_strategy} | "
+                f"missing={missing_count}/{eligible_count} "
+                f"({missing_ratio:.1%}) | thresholds: "
+                f"rows<={TARGETED_ONLY_MAX_ROWS} OR "
+                f"ratio<{TARGETED_ONLY_MAX_RATIO:.0%}"
+            )
             period_work[target_period] = {
                 "sheet": auto_ws,
                 "sheet_name": auto_sheet_name,
                 "symbol_rows": symbol_rows,
                 "restored": restored,
                 "pending_rows": pending_rows,
-                "report_month_column": report_month_column,
-                "stale_last_year_column": stale_last_year_column,
+                "fetch_strategy": fetch_strategy,
+                "header_row": header_row,
+                "header_map": header_map,
             }
 
-        publish_ranges = missing_period_publish_ranges(missing_periods)
+        publish_ranges = missing_period_publish_ranges(batch_periods)
         all_reports = []
         seen_reports = set()
         api = None
         rate_state = {"last_request_at": float("-inf")}
         prior_year_reports_cache = {}
-        if publish_ranges:
+        recovery_reports_cache = {}
+        has_pending_rows = any(
+            work["pending_rows"] for work in period_work.values()
+        )
+        if has_pending_rows:
             api = CodalAPI()
+        if publish_ranges:
             print()
             print("=" * 70)
             print("INCREMENTAL BACKFILL ANNOUNCEMENT RANGES")
@@ -1540,8 +2063,11 @@ def main():
             print("Revision sweep is not part of this backfill mode.")
             print("=" * 70)
         else:
-            print("All eligible Company+Period rows already contain valid data.")
-            print("No BRSAPI announcement request is required.")
+            if has_pending_rows:
+                print("No general BRSAPI fetch is required; all gaps use TARGETED_ONLY.")
+            else:
+                print("All eligible Company+Period rows already contain valid data.")
+                print("No BRSAPI announcement request is required.")
 
         print(
             "\nDEBUG: total reports fetched =",
@@ -1558,11 +2084,14 @@ def main():
             auto_ws = work["sheet"]
             symbol_rows = work["symbol_rows"]
             restored = work["restored"]
+            header_map = work["header_map"]
             pending_company_ids = {item[3] for item in work["pending_rows"]}
+            fetch_strategy = work["fetch_strategy"]
 
             print()
             print("=" * 70)
             print(f"PERIOD: {target_period}")
+            print(f"PRE-FETCH STRATEGY: {fetch_strategy}")
             print("=" * 70)
 
             print(f"{len(symbol_rows)} symbol rows found.")
@@ -1609,12 +2138,30 @@ def main():
                 if company_id not in pending_company_ids:
                     continue
 
-                report, report_count = select_latest_report(
-                    all_reports,
-                    symbol,
-                    company_name,
-                    target_period,
-                )
+                if fetch_strategy == "TARGETED_ONLY":
+                    # Do not consume or trigger any unfiltered period batch in
+                    # this mode; every missing row follows the symbol-filtered
+                    # path from its normal publication window through today.
+                    report, report_count = None, 0
+                else:
+                    report, report_count = select_latest_report(
+                        all_reports,
+                        symbol,
+                        company_name,
+                        target_period,
+                    )
+                recovered_report = False
+                if report is None and api is not None:
+                    report, report_count = recover_missing_report(
+                        api,
+                        symbol,
+                        company_name,
+                        target_period,
+                        rate_state,
+                        recovery_reports_cache,
+                        include_normal_window=(fetch_strategy == "TARGETED_ONLY"),
+                    )
+                    recovered_report = report is not None
 
                 if report is None:
                     print("  MISSING REPORT")
@@ -1639,11 +2186,17 @@ def main():
                     revised += 1
 
                 try:
-                    html, html_path = download_html(
-                        report,
-                        symbol,
-                        target_period,
+                    report, html, html_path, revision_hops = (
+                        resolve_latest_revision(
+                            report,
+                            symbol,
+                            target_period,
+                            rate_state,
+                        )
                     )
+                    resolved_report_count = report_count + revision_hops
+                    if revision_hops and report_count <= 1:
+                        revised += 1
                     parsed = parser.parse(html)
                     fallback_status, prior_report, fallback_message = (
                         apply_prior_year_sales_fallback(
@@ -1662,22 +2215,26 @@ def main():
                         print("  PRIOR-YEAR FALLBACK FILLED:", fallback_message)
                     elif fallback_status != "NOT_NEEDED":
                         print("  PRIOR-YEAR FALLBACK UNAVAILABLE:", fallback_message)
-                    write_parser_result(auto_ws, row, parsed)
+                    write_parser_result(auto_ws, row, parsed, header_map)
 
-                    status = (
-                        "REVISION_SELECTED"
-                        if report_count > 1
-                        else "OK"
-                    )
+                    if recovered_report:
+                        status = "RECOVERED_REPORT"
+                    elif report_count > 1 or revision_hops:
+                        status = "REVISION_SELECTED"
+                    else:
+                        status = "OK"
                     log_result(
                         log_ws,
                         symbol,
                         status,
                         target_period,
                         report=report,
-                        report_count=report_count,
+                        report_count=resolved_report_count,
                         html_path=html_path,
-                        message=fallback_message or "",
+                        message=(
+                            f"Revision chain hops: {revision_hops}. "
+                            + (fallback_message or "")
+                        ).strip(),
                     )
                     success += 1
 
@@ -1704,6 +2261,14 @@ def main():
                         message=f"{type(exc).__name__}: {exc}",
                     )
 
+            # Existing Auto sheets may contain pane-specific selections left
+            # behind by an older openpyxl save.  With no pane element those
+            # selections make Excel repair the worksheet view on every open.
+            for worksheet in wb.worksheets:
+                if worksheet.title.startswith("Auto "):
+                    reset_worksheet_view(worksheet)
+
+            assert_no_external_formulas(wb)
             save_workbook_safely(wb, WORKBOOK_PATH)
 
             print()
