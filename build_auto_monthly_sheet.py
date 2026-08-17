@@ -37,6 +37,13 @@ BRSAPI_MAX_429_RETRIES = 8
 BRSAPI_INITIAL_BACKOFF = 5.0
 BRSAPI_MAX_BACKOFF = 120.0
 
+# CODAL report HTML can intermittently time out even after its announcement was
+# found successfully.  Retry only that exact URL; never restart announcement
+# pagination or the surrounding company batch.
+CODAL_HTML_MAX_TIMEOUT_RETRIES = 3
+CODAL_HTML_INITIAL_BACKOFF = 2.0
+CODAL_HTML_MAX_BACKOFF = 15.0
+
 # Recovery queries are symbol-filtered and normally finish on page one.  Keep a
 # hard safety ceiling in case an upstream API ignores the symbol parameter.
 TARGETED_RECOVERY_MAX_PAGES = 20
@@ -988,6 +995,87 @@ def recover_missing_report(
     return result
 
 
+def fetch_targeted_period_reports(
+    api,
+    symbol,
+    company_name,
+    target_period,
+    rate_state,
+    targeted_reports_cache,
+):
+    """Return the latest report from one symbol-filtered period search.
+
+    Unlike missing-report recovery, this scans the complete normal publication
+    window so ``select_latest_report`` can preserve the existing revision
+    selection behaviour when several announcements exist.  Results (including
+    misses) are cached per symbol and period; unrelated companies are never
+    fetched.
+    """
+    cache_key = (normalize_text(symbol), target_period)
+    if cache_key in targeted_reports_cache:
+        print("  PRIOR-YEAR FALLBACK: using cached targeted result")
+        return targeted_reports_cache[cache_key]
+
+    date_start, date_end = publish_range_for_period(target_period)
+    print(
+        "  PRIOR-YEAR FALLBACK: targeted search | "
+        f"symbol={symbol} | period={target_period} | "
+        f"{date_start} through {date_end}"
+    )
+    reports = []
+    seen = set()
+    previous_page_signature = None
+
+    for page in range(1, TARGETED_RECOVERY_MAX_PAGES + 1):
+        data = _get_announcements_with_retry(
+            api,
+            {
+                "category": CATEGORY,
+                "symbol": symbol,
+                "date_start": date_start,
+                "date_end": date_end,
+                "page": page,
+            },
+            rate_state,
+        )
+        page_reports = data.get("announcement", []) or []
+        print(f"    Page {page}: {len(page_reports)} symbol-filtered result(s)")
+        if not page_reports:
+            break
+
+        page_signature = tuple(
+            announcement_identity(item) for item in page_reports
+        )
+        if page_signature == previous_page_signature:
+            print("    Repeated page detected; targeted search is complete.")
+            break
+        previous_page_signature = page_signature
+
+        for report in page_reports:
+            identity = announcement_identity(report)
+            if identity not in seen:
+                seen.add(identity)
+                reports.append(report)
+
+        count_page = (
+            data.get("count_page") or data.get("countPage")
+            or data.get("total_pages") or data.get("totalPages")
+        )
+        try:
+            if count_page is not None and page >= int(count_page):
+                break
+        except (TypeError, ValueError):
+            pass
+    else:
+        print("    WARNING: targeted pagination safety limit reached.")
+
+    result = select_latest_report(
+        reports, symbol, company_name, target_period
+    )
+    targeted_reports_cache[cache_key] = result
+    return result
+
+
 # ============================================================
 # HTML DOWNLOAD / REVISION RESOLUTION
 # ============================================================
@@ -1065,9 +1153,39 @@ def find_newer_revision_link(html, current_url):
     return None
 
 
+def find_older_revision_link(html, current_url):
+    """Return CODAL's explicit previous/older-version link, never newer."""
+    parser = _RevisionLinkParser()
+    parser.feed(html)
+    newer_hints = (
+        "اطلاعیه جدیدتر", "نسخه جدیدتر", "گزارش جدیدتر",
+        "اطلاعیه بعدی", "نسخه بعدی", "اصلاحیه جدید",
+    )
+    older_hints = (
+        "اطلاعیه قبلی", "نسخه قبلی", "گزارش قبلی", "اطلاعیه پیشین",
+        "نسخه قدیمی", "قدیمی تر", "قدیمی‌تر",
+    )
+    for link in parser.links:
+        context = normalize_text(" ".join((
+            link.get("context_before", ""), link.get("text", ""),
+            link.get("attributes", ""),
+        )))
+        newest_newer_hint = max((context.rfind(hint) for hint in newer_hints), default=-1)
+        newest_older_hint = max((context.rfind(hint) for hint in older_hints), default=-1)
+        if newest_older_hint < 0 or newest_older_hint < newest_newer_hint:
+            continue
+        href = _extract_url_from_href(link.get("href"))
+        if href:
+            resolved = urljoin(current_url, href)
+            if resolved != current_url:
+                return resolved
+    return None
+
+
 def _get_html_with_retry(url, rate_state):
-    """Pace CODAL HTML requests and retry explicit HTTP 429 responses."""
-    retries = 0
+    """Fetch one CODAL URL with bounded retries for 429 and timeouts."""
+    rate_limit_retries = 0
+    timeout_retries = 0
     while True:
         elapsed = time.monotonic() - rate_state["last_request_at"]
         if elapsed < BRSAPI_MIN_REQUEST_INTERVAL:
@@ -1078,21 +1196,41 @@ def _get_html_with_retry(url, rate_state):
             response.raise_for_status()
             response.encoding = "utf-8"
             return response.text
+        except requests.Timeout as error:
+            if timeout_retries >= CODAL_HTML_MAX_TIMEOUT_RETRIES:
+                raise
+            wait_seconds = min(
+                CODAL_HTML_INITIAL_BACKOFF * (2 ** timeout_retries),
+                CODAL_HTML_MAX_BACKOFF,
+            )
+            timeout_retries += 1
+            print(
+                f"  CODAL HTML {type(error).__name__}; waiting "
+                f"{wait_seconds:.1f}s before retry "
+                f"{timeout_retries}/{CODAL_HTML_MAX_TIMEOUT_RETRIES} "
+                "of the same URL."
+            )
+            time.sleep(wait_seconds)
         except requests.HTTPError as error:
-            if not _is_rate_limit_error(error) or retries >= BRSAPI_MAX_429_RETRIES:
+            if (
+                not _is_rate_limit_error(error)
+                or rate_limit_retries >= BRSAPI_MAX_429_RETRIES
+            ):
                 raise
             retry_after = _retry_after_seconds(error)
             backoff = min(
-                BRSAPI_INITIAL_BACKOFF * (2 ** retries), BRSAPI_MAX_BACKOFF
+                BRSAPI_INITIAL_BACKOFF * (2 ** rate_limit_retries),
+                BRSAPI_MAX_BACKOFF,
             )
             wait_seconds = max(
                 retry_after if retry_after is not None else backoff,
                 BRSAPI_MIN_REQUEST_INTERVAL,
             )
-            retries += 1
+            rate_limit_retries += 1
             print(
                 f"  CODAL HTML rate limit (429); waiting {wait_seconds:.1f}s "
-                f"before retry {retries}/{BRSAPI_MAX_429_RETRIES}."
+                f"before retry {rate_limit_retries}/"
+                f"{BRSAPI_MAX_429_RETRIES} of the same URL."
             )
             time.sleep(wait_seconds)
 
@@ -1104,33 +1242,170 @@ def _write_report_html(html, symbol, target_period):
     return path
 
 
-def resolve_latest_revision(report, symbol, target_period, rate_state):
-    """Follow explicit CODAL newer-version links and return the terminal HTML."""
+def resolve_revision_chain(report, symbol, rate_state):
+    """Return every explicitly linked CODAL revision, oldest to newest.
+
+    The chain is fetched exactly once.  Parsing/selection is deliberately kept
+    separate so a metadata-only or otherwise empty correction can fall back to
+    the most recent earlier version that still contains monthly-sales data.
+    """
     current_report = dict(report)
     current_url = current_report.get("link")
     if not current_url:
         raise RuntimeError(f"No HTML link for {symbol}")
 
     visited = set()
+    chain = []
     hops = 0
+
     while True:
         if current_url in visited:
             raise RuntimeError(f"Revision link cycle detected for {symbol}")
         visited.add(current_url)
+
         html = _get_html_with_retry(current_url, rate_state)
+        chain.append((dict(current_report), html))
+
         newer_url = find_newer_revision_link(html, current_url)
         if not newer_url:
-            path = _write_report_html(html, symbol, target_period)
-            return current_report, html, path, hops
+            return chain
+
         hops += 1
         if hops > REVISION_CHAIN_MAX_HOPS:
             raise RuntimeError(
                 f"Revision chain exceeded {REVISION_CHAIN_MAX_HOPS} hops for {symbol}"
             )
+
         print(f"  REVISION RESOLVER: following newer version ({hops})")
         current_url = newer_url
         current_report = dict(current_report)
         current_report["link"] = current_url
+
+
+def resolve_latest_revision(report, symbol, target_period, rate_state):
+    """Follow explicit CODAL newer-version links and return the terminal HTML."""
+    chain = resolve_revision_chain(report, symbol, rate_state)
+    current_report, html = chain[-1]
+    path = _write_report_html(html, symbol, target_period)
+    return current_report, html, path, len(chain) - 1
+
+
+def _missing_monthly_datasource(error):
+    """True only for the known CODAL empty-revision monthly-data condition."""
+    return (
+        isinstance(error, ValueError)
+        and "CODAL datasource JSON not found in HTML" in str(error)
+    )
+
+
+def resolve_latest_parseable_revision(
+    report,
+    symbol,
+    target_period,
+    rate_state,
+    parser,
+):
+    """Prefer the newest revision, but skip empty/non-data corrections.
+
+    Normal behaviour is unchanged: follow explicit newer-version links, then
+    parse newest-to-oldest.  One CODAL edge case is handled additionally:
+    targeted recovery may start directly on an empty correction page.  Such a
+    page has no newer link, but CODAL exposes an explicit "previous version"
+    link.  Only when the selected page fails with the known missing-datasource
+    ValueError do we walk those older links until a usable monthly-sales page
+    is found.  All other parse errors are re-raised unchanged.
+    """
+    chain = resolve_revision_chain(report, symbol, rate_state)
+    total_revision_hops = len(chain) - 1
+    missing_error = None
+
+    # First preserve the established 1608_4/1608_5 behaviour: newest -> oldest
+    # inside the explicitly resolved forward revision chain.
+    for reverse_index, (candidate_report, candidate_html) in enumerate(
+        reversed(chain)
+    ):
+        try:
+            parsed = parser.parse(candidate_html)
+        except ValueError as error:
+            if not _missing_monthly_datasource(error):
+                raise
+            missing_error = error
+            if reverse_index < len(chain) - 1:
+                print(
+                    "  REVISION RESOLVER: newest version has no usable "
+                    "monthly-sales datasource -> falling back to previous "
+                    f"version ({reverse_index + 1})"
+                )
+                continue
+            break
+
+        html_path = _write_report_html(
+            candidate_html,
+            symbol,
+            target_period,
+        )
+        chosen_revision_hops = total_revision_hops - reverse_index
+        return (
+            candidate_report,
+            parsed,
+            html_path,
+            total_revision_hops,
+            chosen_revision_hops,
+            reverse_index,
+        )
+
+    # Special recovery case: the starting announcement itself can be the empty
+    # correction.  Follow CODAL's explicit older/previous-version links only
+    # after the known missing-datasource failure.
+    oldest_report, oldest_html = chain[0]
+    current_report = dict(oldest_report)
+    current_html = oldest_html
+    current_url = current_report.get("link")
+    visited = {item_report.get("link") for item_report, _html in chain}
+    backward_hops = 0
+
+    while current_url:
+        older_url = find_older_revision_link(current_html, current_url)
+        if not older_url or older_url in visited:
+            break
+        backward_hops += 1
+        if backward_hops > REVISION_CHAIN_MAX_HOPS:
+            raise RuntimeError(
+                f"Revision backward chain exceeded {REVISION_CHAIN_MAX_HOPS} hops for {symbol}"
+            )
+        visited.add(older_url)
+        print(
+            "  REVISION RESOLVER: selected revision has no usable "
+            "monthly-sales datasource -> following previous CODAL version "
+            f"({backward_hops})"
+        )
+        current_url = older_url
+        current_report = dict(current_report)
+        current_report["link"] = current_url
+        current_html = _get_html_with_retry(current_url, rate_state)
+
+        try:
+            parsed = parser.parse(current_html)
+        except ValueError as error:
+            if not _missing_monthly_datasource(error):
+                raise
+            missing_error = error
+            continue
+
+        html_path = _write_report_html(current_html, symbol, target_period)
+        return (
+            current_report,
+            parsed,
+            html_path,
+            total_revision_hops,
+            0,
+            backward_hops,
+        )
+
+    if missing_error is not None:
+        raise missing_error
+    raise ValueError(f"No parseable monthly-sales revision found for {symbol}")
+
 
 def apply_prior_year_sales_fallback(
     parsed,
@@ -1146,32 +1421,23 @@ def apply_prior_year_sales_fallback(
     """Fill a structurally absent current-report comparison from prior YTD.
 
     This function must only be called after the current report parsed
-    successfully.  Announcement batches are cached by prior-year period, so
-    every company sharing that publication window reuses the same BRSAPI data.
+    successfully.  The lookup is symbol-filtered and cached by symbol+period,
+    so one missing comparison never downloads the prior-year market batch.
     """
     if parsed.get("sales_last_year") is not None:
         return "NOT_NEEDED", None, None
 
     fallback_period = prior_year_period(target_period)
-    if fallback_period not in prior_year_reports_cache:
-        date_start, date_end = publish_range_for_period(fallback_period)
-        print(
-            "  PRIOR-YEAR FALLBACK: fetching cached announcement batch "
-            f"for {fallback_period} ({date_start} through {date_end})"
-        )
-        prior_year_reports_cache[fallback_period] = fetch_all_announcements(
-            api,
-            date_start,
-            date_end,
-            company_count=company_count,
-            rate_state=rate_state,
-        )
-
-    prior_report, prior_report_count = select_latest_report(
-        prior_year_reports_cache[fallback_period],
+    # Retain ``company_count`` in the signature for call-site compatibility;
+    # targeted lookup deliberately does not use it.
+    _ = company_count
+    prior_report, prior_report_count = fetch_targeted_period_reports(
+        api,
         symbol,
         company_name,
         fallback_period,
+        rate_state,
+        prior_year_reports_cache,
     )
     if prior_report is None:
         return "MISSING_PRIOR_REPORT", None, (
@@ -2186,18 +2452,29 @@ def main():
                     revised += 1
 
                 try:
-                    report, html, html_path, revision_hops = (
-                        resolve_latest_revision(
-                            report,
-                            symbol,
-                            target_period,
-                            rate_state,
-                        )
+                    (
+                        report,
+                        parsed,
+                        html_path,
+                        revision_hops,
+                        chosen_revision_hops,
+                        revision_fallback_hops,
+                    ) = resolve_latest_parseable_revision(
+                        report,
+                        symbol,
+                        target_period,
+                        rate_state,
+                        parser,
                     )
                     resolved_report_count = report_count + revision_hops
                     if revision_hops and report_count <= 1:
                         revised += 1
-                    parsed = parser.parse(html)
+                    if revision_fallback_hops:
+                        print(
+                            "  REVISION FALLBACK SUCCESS: "
+                            f"using earlier usable version "
+                            f"({revision_fallback_hops} step(s) back)"
+                        )
                     fallback_status, prior_report, fallback_message = (
                         apply_prior_year_sales_fallback(
                             parsed,
@@ -2219,7 +2496,7 @@ def main():
 
                     if recovered_report:
                         status = "RECOVERED_REPORT"
-                    elif report_count > 1 or revision_hops:
+                    elif report_count > 1 or revision_hops or revision_fallback_hops:
                         status = "REVISION_SELECTED"
                     else:
                         status = "OK"
